@@ -1,0 +1,17 @@
+`timescale 1ns/1ps
+
+module dl_ack_nak_gen(
+
+    input  logic rx_valid,
+    input  logic crc_ok,
+
+    output logic ack_req,
+    output logic nak_req
+);
+
+always_comb begin
+    ack_req = rx_valid &  crc_ok;
+    nak_req = rx_valid & ~crc_ok;
+end
+
+endmodule
