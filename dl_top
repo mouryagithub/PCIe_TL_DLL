@@ -1,0 +1,47 @@
+`timescale 1ns/1ps
+// ================================================================
+// dl_top.sv  - FIXED VERSION
+//
+// Change from original:
+//   tlp_packet input changed from [171:0] to [159:0]
+//   dl_seq_insert now receives [159:0] and prepends seq_num
+//   internally to produce [171:0] for the rest of TX pipeline.
+//
+// WHY: payload_inserter (TL) outputs 160-bit tlp_packet.
+//   The original dl_top had [171:0] which would leave the top
+//   12 bits undefined/zero - seq_insert must own those bits.
+// ================================================================
+module dl_top(
+    input  logic clk,
+    input  logic rst_n,
+    input  logic [159:0] tlp_packet,    // ? FIXED: 160-bit from TL
+    input  logic         tlp_valid,
+    output logic [203:0] phy_tx_data,
+    output logic         phy_tx_valid,
+    input  logic [203:0] phy_rx_data,
+    input  logic         phy_rx_valid,
+    output logic crc_ok,
+    output logic ack_req,
+    output logic nak_req
+);
+
+dl_tx_engine tx_engine(
+    .clk(clk),
+    .rst_n(rst_n),
+    .tlp_in(tlp_packet),
+    .tlp_valid(tlp_valid),
+    .phy_tx_data(phy_tx_data),
+    .phy_tx_valid(phy_tx_valid)
+);
+
+dl_rx_engine rx_engine(
+    .clk(clk),
+    .rst_n(rst_n),
+    .phy_rx_data(phy_rx_data),
+    .phy_rx_valid(phy_rx_valid),
+    .crc_ok(crc_ok),
+    .ack_req(ack_req),
+    .nak_req(nak_req)
+);
+
+endmodule
