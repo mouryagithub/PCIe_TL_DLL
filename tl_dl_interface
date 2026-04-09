@@ -1,0 +1,51 @@
+`timescale 1ns/1ps
+// ================================================================
+// tl_dl_interface.sv  -  FIXED VERSION
+//
+// Fix applied: removed .rst() connection to tlp_top.
+// tlp_top's actual port list is: clk, rst_n, payload_data,
+// payload_valid, tlp_packet, tlp_valid  -- NO separate 'rst'.
+// ================================================================
+module tl_dl_interface (
+    input  logic         clk,
+    input  logic         rst_n,
+    // Payload stream from application into TL
+    input  logic [31:0]  payload_data,
+    input  logic         payload_valid,
+    // PHY interface (DLL <-> PHY)
+    output logic [203:0] phy_tx_data,
+    output logic         phy_tx_valid,
+    input  logic [203:0] phy_rx_data,
+    input  logic         phy_rx_valid,
+    // DLL RX status outputs
+    output logic         crc_ok,
+    output logic         ack_req,
+    output logic         nak_req
+);
+    // Internal 160-bit TL->DLL handshake
+    logic [159:0] tlp_packet;
+    logic         tlp_valid;
+    // ---- Transaction Layer --------------------------------
+    tlp_top u_tl (
+        .clk          (clk),
+        .rst_n        (rst_n),
+        .payload_data (payload_data),
+        .payload_valid(payload_valid),
+        .tlp_packet   (tlp_packet),
+        .tlp_valid    (tlp_valid)
+    );
+    // ---- Data Link Layer ---------------------------------
+    dl_top u_dll (
+        .clk          (clk),
+        .rst_n        (rst_n),
+        .tlp_packet   (tlp_packet),
+        .tlp_valid    (tlp_valid),
+        .phy_tx_data  (phy_tx_data),
+        .phy_tx_valid (phy_tx_valid),
+        .phy_rx_data  (phy_rx_data),
+        .phy_rx_valid (phy_rx_valid),
+        .crc_ok       (crc_ok),
+        .ack_req      (ack_req),
+        .nak_req      (nak_req)
+    );
+endmodule
