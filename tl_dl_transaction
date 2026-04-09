@@ -1,0 +1,648 @@
+`timescale 1ns/1ps
+
+// ================================================================
+//  PCIe Gen3 TL + DLL Testbench
+//  Signal visibility designed for:
+//    - Waveform analysis  (VCD / GTKWave / Vivado)
+//    - Functional verification (scoreboard checks)
+//    - Protocol-level debug (TLP fields, SEQ, LCRC, ACK/NAK)
+// ================================================================
+
+// ================================================================
+// Transaction - carries all observed signal state
+// ================================================================
+class tl_dl_transaction;
+    rand logic [31:0] payload;
+
+    // ── TL layer captures ──────────────────────────────────────
+    logic [159:0] tlp_captured;
+    logic         got_tlp_valid;
+
+    // TLP header fields (decoded for scoreboard)
+    logic [7:0]   tlp_type;          // TLP type field [159:152]
+    logic [9:0]   tlp_length;        // DW length      [149:140]
+    logic [15:0]  tlp_requester_id;  // Requester ID   [127:112]
+    logic [7:0]   tlp_tag;           // Tag            [111:104]
+
+    // ── DLL TX captures ────────────────────────────────────────
+    logic [203:0] phy_tx_out;
+    logic         got_phy_tx;
+    logic [11:0]  seq_num_captured;  // SEQ[11:0]
+    logic [31:0]  lcrc_captured;     // LCRC[31:0]
+
+    // ── DLL RX / ACK captures ──────────────────────────────────
+    logic got_crc_ok;
+    logic got_ack;
+    logic got_nak;
+    logic [11:0] ack_seq_num;        // SEQ being ACK'd
+
+    // ── Timing metrics ─────────────────────────────────────────
+    int   tl_cycle;                  // cycle TLP was formed
+    int   dll_cycle;                 // cycle PHY TX fired
+    int   ack_cycle;                 // cycle ACK was seen
+    int   tl_to_dll_latency;         // DLL - TL cycle delta
+    int   dll_to_ack_latency;        // ACK - DLL cycle delta
+
+    function new(logic [31:0] p = 32'hDEADBEEF);
+        payload             = p;
+        got_phy_tx          = 0;
+        got_crc_ok          = 0;
+        got_ack             = 0;
+        got_nak             = 0;
+        got_tlp_valid       = 0;
+        seq_num_captured    = 0;
+        lcrc_captured       = 0;
+        ack_seq_num         = 0;
+        tl_cycle            = 0;
+        dll_cycle           = 0;
+        ack_cycle           = 0;
+        tl_to_dll_latency   = 0;
+        dll_to_ack_latency  = 0;
+    endfunction
+endclass
+
+// ================================================================
+// Interface - ALL signals needed for waveform + verification
+// ================================================================
+interface tl_dl_if(input logic clk);
+
+    // ── Primary DUT ports ──────────────────────────────────────
+    logic        rst_n;
+    logic [31:0] payload_data;
+    logic        payload_valid;
+
+    logic [203:0] phy_tx_data;
+    logic         phy_tx_valid;
+
+    logic [203:0] phy_rx_data;
+    logic         phy_rx_valid;
+
+    logic crc_ok;
+    logic ack_req;
+    logic nak_req;
+
+    // ── TL internal signals (hierarchical probe) ───────────────
+    logic [159:0] tlp_packet;
+    logic         tlp_valid;
+
+    // ── TLP header fields (decoded for waveform readability) ───
+    logic [7:0]   tlp_type;          // tlp_packet[159:152]
+    logic [9:0]   tlp_length;        // tlp_packet[149:140]
+    logic [15:0]  tlp_requester_id;  // tlp_packet[127:112]
+    logic [7:0]   tlp_tag;           // tlp_packet[111:104]
+    logic [31:0]  tlp_payload_word;  // tlp_packet[31:0]
+
+    // ── DLL frame fields (decoded for waveform readability) ────
+    logic [11:0]  tx_seq_num;        // phy_tx_data[15:4]
+    logic [31:0]  tx_lcrc;           // phy_tx_data[203:172]
+    logic [3:0]   tx_dllp_ctrl;      // phy_tx_data[3:0]
+
+    // ── ACK/NAK sequence tracking ──────────────────────────────
+    logic [11:0]  ack_seq_num;       // SEQ being acknowledged
+
+    // ── Verification counters (visible in waveform) ────────────
+    logic [31:0]  v_tx_count;
+    logic [31:0]  v_rx_count;
+    logic [31:0]  v_ack_count;
+    logic [31:0]  v_nak_count;
+    logic [31:0]  v_cycle_count;
+
+    // ── Pipeline stage flags (debug) ───────────────────────────
+    logic         tl_active;         // TLP being formed
+    logic         dll_tx_active;     // DLL TX in progress
+    logic         dll_rx_active;     // DLL RX in progress
+    logic         link_up;           // rst_n proxy
+
+endinterface
+
+// ================================================================
+// Driver
+// ================================================================
+class driver;
+    virtual tl_dl_if vif;
+
+    function new(virtual tl_dl_if vif);
+        this.vif = vif;
+    endfunction
+
+    task apply_reset();
+        $display("");
+        $display("+---------------------------------------------------------+");
+        $display("|             RESET SEQUENCE INITIATED                    |");
+        $display("+---------------------------------------------------------+");
+
+        vif.rst_n         <= 0;
+        vif.payload_valid <= 0;
+        vif.phy_rx_valid  <= 0;
+        vif.payload_data  <= 0;
+        vif.phy_rx_data   <= 0;
+
+        repeat(5) @(posedge vif.clk);
+        $display("| [RST]  rst_n asserted (DUT in reset) at %0t ns         |", $time/10);
+        vif.rst_n <= 1;
+
+        repeat(2) @(posedge vif.clk);
+        $display("| [RST]  Reset released. Link UP at %0t ns               |", $time/10);
+        $display("+---------------------------------------------------------+");
+        $display("");
+    endtask
+
+    task drive(tl_dl_transaction tr);
+        repeat(20) @(posedge vif.clk);
+
+        $display("+---------------------------------------------------------+");
+        $display("|                  DRIVING PAYLOAD                        |");
+        $display("+---------------------------------------------------------+");
+        $display("| Payload Data  : 0x%08X                                |", tr.payload);
+        $display("| Drive Time    : %0t ns                                  |", $time/10);
+        $display("+---------------------------------------------------------+");
+
+        vif.payload_data  <= tr.payload;
+        vif.payload_valid <= 1;
+        @(posedge vif.clk);
+        vif.payload_valid <= 0;
+        vif.payload_data  <= 0;
+    endtask
+
+    // Runs inside fork - polls for phy_tx_valid then feeds back
+    task loopback_rx();
+        repeat(60) begin
+            @(posedge vif.clk);
+            if (vif.phy_tx_valid) begin
+                $display("");
+                $display("+---------------------------------------------------------+");
+                $display("|           DLL LOOPBACK  (TX -> RX)                      |");
+                $display("+---------------------------------------------------------+");
+                $display("| Time           : %0t ns                                 |", $time/10);
+                $display("| Frame[203:172] : LCRC  = 0x%08X                      |", vif.phy_tx_data[203:172]);
+                $display("| Frame[171:16]  : TLP   = 0x%039X|", vif.phy_tx_data[171:16]);
+                $display("| Frame[15:4]    : SEQ   = 0x%03X                        |", vif.phy_tx_data[15:4]);
+                $display("| Frame[3:0]     : DLLP  = 0x%X                          |", vif.phy_tx_data[3:0]);
+                $display("+---------------------------------------------------------+");
+
+                vif.phy_rx_data  <= vif.phy_tx_data;
+                vif.phy_rx_valid <= 1;
+                @(posedge vif.clk);
+                vif.phy_rx_valid <= 0;
+                return;
+            end
+        end
+        $display("| [WARN] loopback_rx: phy_tx_valid not seen in 60 cycles  |");
+    endtask
+endclass
+
+// ================================================================
+// Monitor
+// ================================================================
+class monitor;
+    virtual tl_dl_if vif;
+
+    function new(virtual tl_dl_if vif);
+        this.vif = vif;
+    endfunction
+
+    task capture(tl_dl_transaction tr);
+        int cycle = 0;
+
+        repeat(120) begin
+            @(posedge vif.clk);
+            cycle++;
+
+            // ── TL: TLP formation ──────────────────────────────
+            if (vif.tlp_valid && !tr.got_tlp_valid) begin
+                tr.got_tlp_valid      = 1;
+                tr.tlp_captured       = vif.tlp_packet;
+                tr.tl_cycle           = cycle;
+
+                // Decode header fields
+                tr.tlp_type           = vif.tlp_packet[159:152];
+                tr.tlp_length         = vif.tlp_packet[149:140];
+                tr.tlp_requester_id   = vif.tlp_packet[127:112];
+                tr.tlp_tag            = vif.tlp_packet[111:104];
+
+                $display("");
+                $display("+--------------------------------------------------+");
+                $display("|  [MON-TL] TLP FORMED @ cycle %-4d                |", cycle);
+                $display("+--------------------------------------------------+");
+                $display("|  TLP Type       : 0x%02X                          |", tr.tlp_type);
+                $display("|  Length (DW)    : %0d                             |", tr.tlp_length);
+                $display("|  Requester ID   : 0x%04X                        |", tr.tlp_requester_id);
+                $display("|  Tag            : 0x%02X                          |", tr.tlp_tag);
+                $display("|  Payload[31:0]  : 0x%08X                    |", vif.tlp_packet[31:0]);
+                $display("|  Full TLP[159:0]: 0x%040X|", vif.tlp_packet);
+                $display("+--------------------------------------------------+");
+            end
+
+            // ── DLL TX: frame assembly + PHY output ────────────
+            if (vif.phy_tx_valid && !tr.got_phy_tx) begin
+                tr.got_phy_tx        = 1;
+                tr.phy_tx_out        = vif.phy_tx_data;
+                tr.seq_num_captured  = vif.phy_tx_data[15:4];
+                tr.lcrc_captured     = vif.phy_tx_data[203:172];
+                tr.dll_cycle         = cycle;
+                tr.tl_to_dll_latency = cycle - tr.tl_cycle;
+
+                $display("");
+                $display("+--------------------------------------------------+");
+                $display("|  [MON-DLL-TX] PHY FRAME @ cycle %-4d             |", cycle);
+                $display("+--------------------------------------------------+");
+                $display("|  SEQ NUM        : 0x%03X (%0d)                   |",
+                         tr.seq_num_captured, tr.seq_num_captured);
+                $display("|  LCRC           : 0x%08X                    |", tr.lcrc_captured);
+                $display("|  DLLP Ctrl[3:0] : 0x%X                          |",
+                         vif.phy_tx_data[3:0]);
+                $display("|  TL->DLL gap    : %0d cycles                     |",
+                         tr.tl_to_dll_latency);
+                $display("+--------------------------------------------------+");
+            end
+
+            // ── DLL RX: loopback observed ──────────────────────
+            if (vif.phy_rx_valid) begin
+                $display("|  [MON-DLL-RX] RX VALID @ cycle %-4d             |", cycle);
+                $display("|  RX Frame[203:172] LCRC : 0x%08X            |",
+                         vif.phy_rx_data[203:172]);
+                $display("|  RX Frame[15:4]    SEQ  : 0x%03X               |",
+                         vif.phy_rx_data[15:4]);
+            end
+
+            // ── DLL RX: CRC verdict ────────────────────────────
+            if (vif.crc_ok && !tr.got_crc_ok) begin
+                tr.got_crc_ok = 1;
+                $display("|  [MON-DLL-RX] CRC OK @ cycle %-4d               |", cycle);
+            end
+
+            // ── DLL RX: ACK/NAK decision ───────────────────────
+            if (vif.ack_req && !tr.got_ack) begin
+                tr.got_ack             = 1;
+                tr.ack_cycle           = cycle;
+                tr.dll_to_ack_latency  = cycle - tr.dll_cycle;
+                $display("|  [MON-DLL-RX] ACK REQ @ cycle %-4d              |", cycle);
+                $display("|  DLL->ACK latency : %0d cycles                  |",
+                         tr.dll_to_ack_latency);
+            end
+
+            if (vif.nak_req && !tr.got_nak) begin
+                tr.got_nak    = 1;
+                $display("|  [MON-DLL-RX] NAK REQ @ cycle %-4d              |", cycle);
+                $display("|  >> Replay buffer trigger expected               |");
+            end
+        end
+    endtask
+endclass
+
+// ================================================================
+// Scoreboard
+// ================================================================
+class scoreboard;
+    int pass = 0;
+    int fail = 0;
+    int warn = 0;
+
+    function void check(tl_dl_transaction tr);
+        $display("");
+        $display("+=========================================================+");
+        $display("|              SCOREBOARD - PROTOCOL CHECKS               |");
+        $display("+=========================================================+");
+
+        // ── TL checks ─────────────────────────────────────────
+        $display("| TL LAYER                                                |");
+        $display("+---------------------------------------------------------+");
+
+        if (tr.got_tlp_valid) begin
+            $display("| [PASS] TLP packet formed                                |");
+            pass++;
+        end else begin
+            $display("| [FAIL] No TLP packet - tlp_valid never asserted         |");
+            fail++;
+        end
+
+        if (tr.got_tlp_valid && (tr.tlp_captured[31:0] === tr.payload)) begin
+            $display("| [PASS] TLP payload correct : 0x%08X               |", tr.payload);
+            pass++;
+        end else if (tr.got_tlp_valid) begin
+            $display("| [FAIL] TLP payload MISMATCH exp=0x%08X got=0x%08X|",
+                     tr.payload, tr.tlp_captured[31:0]);
+            fail++;
+        end
+
+        if (tr.got_tlp_valid && tr.tlp_type !== 8'hXX) begin
+            $display("| [INFO] TLP Type=0x%02X  Length=%0d DW  Tag=0x%02X       |",
+                     tr.tlp_type, tr.tlp_length, tr.tlp_tag);
+        end
+
+        // ── DLL TX checks ─────────────────────────────────────
+        $display("+---------------------------------------------------------+");
+        $display("| DLL TX                                                  |");
+        $display("+---------------------------------------------------------+");
+
+        if (tr.got_phy_tx) begin
+            $display("| [PASS] PHY TX frame transmitted                         |");
+            $display("|        SEQ=0x%03X  LCRC=0x%08X                     |",
+                     tr.seq_num_captured, tr.lcrc_captured);
+            pass++;
+        end else begin
+            $display("| [FAIL] No PHY TX - phy_tx_valid never asserted          |");
+            fail++;
+        end
+
+        if (tr.got_phy_tx && tr.tl_to_dll_latency > 0) begin
+            $display("| [INFO] TL->DLL pipeline latency : %0d cycles            |",
+                     tr.tl_to_dll_latency);
+        end
+
+        // ── DLL RX checks ─────────────────────────────────────
+        $display("+---------------------------------------------------------+");
+        $display("| DLL RX                                                  |");
+        $display("+---------------------------------------------------------+");
+
+        if (tr.got_crc_ok && tr.got_ack) begin
+            $display("| [PASS] CRC OK + ACK - clean packet delivery             |");
+            $display("|        DLL->ACK latency : %0d cycles                   |",
+                     tr.dll_to_ack_latency);
+            pass++;
+        end else if (tr.got_crc_ok && !tr.got_ack) begin
+            $display("| [WARN] CRC OK but ACK not observed                      |");
+            $display("|        Check ack_req path in dl_top RX FSM              |");
+            warn++;
+        end else if (!tr.got_crc_ok && tr.got_ack) begin
+            $display("| [WARN] ACK seen but crc_ok not asserted                 |");
+            $display("|        Possible crc_ok pulse missed by monitor          |");
+            warn++;
+        end else begin
+            $display("| [FAIL] Neither CRC OK nor ACK observed                  |");
+            $display("|        Check dl_top RX datapath and loopback timing     |");
+            fail++;
+        end
+
+        if (tr.got_nak) begin
+            $display("| [WARN] NAK asserted - replay buffer should activate     |");
+            warn++;
+        end else begin
+            $display("| [PASS] No spurious NAK                                  |");
+            pass++;
+        end
+
+        $display("+=========================================================+");
+    endfunction
+
+    function void report();
+        $display("");
+        $display("+=========================================================+");
+        $display("|                    FINAL REPORT                         |");
+        $display("+=========================================================+");
+        $display("|  PASS : %-4d                                            |", pass);
+        $display("|  FAIL : %-4d                                            |", fail);
+        $display("|  WARN : %-4d                                            |", warn);
+        $display("+---------------------------------------------------------+");
+        if (fail == 0 && warn == 0)
+            $display("|      *** ALL CHECKS PASSED - CLEAN RUN ***              |");
+        else if (fail == 0)
+            $display("|      *** PASSED with %0d WARNING(S) ***                 |", warn);
+        else
+            $display("|      *** %0d FAILURE(S) DETECTED ***                    |", fail);
+        $display("+=========================================================+");
+        $display("");
+    endfunction
+endclass
+
+// ================================================================
+// Environment
+// ================================================================
+class environment;
+    driver     drv;
+    monitor    mon;
+    scoreboard scb;
+
+    function new(virtual tl_dl_if vif);
+        drv = new(vif);
+        mon = new(vif);
+        scb = new();
+    endfunction
+
+    task run();
+        tl_dl_transaction tr;
+        drv.apply_reset();
+        tr = new(32'hDEADBEEF);
+
+        fork
+            drv.drive(tr);
+            drv.loopback_rx();   // concurrent - RX fires while monitor is open
+            mon.capture(tr);
+        join
+
+        // Catch any late-arriving signals
+        repeat(5) @(posedge drv.vif.clk);
+        if (drv.vif.crc_ok)  tr.got_crc_ok = 1;
+        if (drv.vif.ack_req) tr.got_ack    = 1;
+        if (drv.vif.nak_req) tr.got_nak    = 1;
+
+        scb.check(tr);
+        scb.report();
+    endtask
+endclass
+
+// ================================================================
+// TESTBENCH TOP
+// ================================================================
+module tb_tl_dl_interface;
+
+    logic clk = 0;
+    always #5 clk = ~clk;
+
+    tl_dl_if dut_if(clk);
+
+    // ── DUT ──────────────────────────────────────────────────────
+    tl_dl_interface dut (
+        .clk          (clk),
+        .rst_n        (dut_if.rst_n),
+        .payload_data (dut_if.payload_data),
+        .payload_valid(dut_if.payload_valid),
+        .phy_tx_data  (dut_if.phy_tx_data),
+        .phy_tx_valid (dut_if.phy_tx_valid),
+        .phy_rx_data  (dut_if.phy_rx_data),
+        .phy_rx_valid (dut_if.phy_rx_valid),
+        .crc_ok       (dut_if.crc_ok),
+        .ack_req      (dut_if.ack_req),
+        .nak_req      (dut_if.nak_req)
+    );
+
+    // ================================================================
+    // WAVEFORM GROUP 1 - TL Internal Probes
+    // (hierarchical reference into tlp_top)
+    // ================================================================
+    assign dut_if.tlp_packet       = dut.u_tl.tlp_packet;
+    assign dut_if.tlp_valid        = dut.u_tl.tlp_valid;
+
+    // Decoded TLP header fields - appear as named signals in waveform
+    assign dut_if.tlp_type         = dut.u_tl.tlp_packet[159:152];
+    assign dut_if.tlp_length       = dut.u_tl.tlp_packet[149:140];
+    assign dut_if.tlp_requester_id = dut.u_tl.tlp_packet[127:112];
+    assign dut_if.tlp_tag          = dut.u_tl.tlp_packet[111:104];
+    assign dut_if.tlp_payload_word = dut.u_tl.tlp_packet[31:0];
+
+    // ================================================================
+    // WAVEFORM GROUP 2 - DLL TX Frame Decode
+    // ================================================================
+    assign dut_if.tx_seq_num       = dut_if.phy_tx_data[15:4];
+    assign dut_if.tx_lcrc          = dut_if.phy_tx_data[203:172];
+    assign dut_if.tx_dllp_ctrl     = dut_if.phy_tx_data[3:0];
+
+    // ================================================================
+    // WAVEFORM GROUP 3 - Pipeline Stage Flags
+    // ================================================================
+    assign dut_if.tl_active        = dut_if.tlp_valid;
+    assign dut_if.dll_tx_active    = dut_if.phy_tx_valid;
+    assign dut_if.dll_rx_active    = dut_if.phy_rx_valid;
+    assign dut_if.link_up          = dut_if.rst_n;
+
+    environment env;
+
+    // ================================================================
+    // WAVEFORM GROUP 4 - Verification Counters
+    // (driven into interface so they appear in waveform viewer)
+    // ================================================================
+    int  tx_count    = 0;
+    int  rx_count    = 0;
+    int  ack_count   = 0;
+    int  nak_count   = 0;
+    int  cycle_count = 0;
+
+    assign dut_if.v_tx_count    = tx_count;
+    assign dut_if.v_rx_count    = rx_count;
+    assign dut_if.v_ack_count   = ack_count;
+    assign dut_if.v_nak_count   = nak_count;
+    assign dut_if.v_cycle_count = cycle_count;
+
+    time payload_time  = 0;
+    time first_tx_time = 0;
+    time last_tx_time  = 0;
+
+    always @(posedge clk) cycle_count++;
+
+    always @(posedge clk)
+        if (dut_if.payload_valid) payload_time = $time;
+
+    always @(posedge clk) begin
+        if (dut_if.phy_tx_valid) begin
+            tx_count++;
+            if (tx_count == 1) first_tx_time = $time;
+            last_tx_time = $time;
+            $display("| [PERF] TX#%-2d | @%0t ns | lat=%0t ns | SEQ=0x%03X | LCRC=0x%08X",
+                     tx_count, $time/10, ($time - payload_time)/10,
+                     dut_if.phy_tx_data[15:4], dut_if.phy_tx_data[203:172]);
+        end
+    end
+
+    always @(posedge clk) if (dut_if.phy_rx_valid) rx_count++;
+    always @(posedge clk) if (dut_if.ack_req)      ack_count++;
+    always @(posedge clk) if (dut_if.nak_req)      nak_count++;
+
+    // ── Signal snapshot every 50 cycles ──────────────────────────
+    always @(posedge clk) begin
+        if (cycle_count % 50 == 0) begin
+            $display("");
+            $display("+-- SIGNAL SNAPSHOT @ cycle %-4d --------------------------+", cycle_count);
+            $display("| link_up=%b | tl_active=%b | dll_tx=%b | dll_rx=%b          |",
+                     dut_if.link_up, dut_if.tl_active,
+                     dut_if.dll_tx_active, dut_if.dll_rx_active);
+            $display("| payload_valid=%b | tlp_valid=%b | phy_tx_valid=%b           |",
+                     dut_if.payload_valid, dut_if.tlp_valid, dut_if.phy_tx_valid);
+            $display("| crc_ok=%b | ack_req=%b | nak_req=%b                         |",
+                     dut_if.crc_ok, dut_if.ack_req, dut_if.nak_req);
+            $display("| SEQ=0x%03X | LCRC=0x%08X                              |",
+                     dut_if.tx_seq_num, dut_if.tx_lcrc);
+            $display("| tx=%0d rx=%0d ack=%0d nak=%0d                              |",
+                     tx_count, rx_count, ack_count, nak_count);
+            $display("+----------------------------------------------------------+");
+        end
+    end
+
+    // ================================================================
+    // WAVEFORM DUMP - organised groups
+    // ================================================================
+    initial begin
+        $dumpfile("wave.vcd");
+
+        // Group 0: full TB hierarchy
+        $dumpvars(0, tb_tl_dl_interface);
+
+        // Group 1: DUT interface (all decoded fields included)
+        $dumpvars(0, dut_if);
+
+        // Group 2: DUT internals
+        $dumpvars(0, dut);
+
+        // Group 3: explicit TL probes (belt-and-suspenders for
+        //          simulators that don't follow interface assigns)
+        $dumpvars(1, dut.u_tl);
+        $dumpvars(1, dut.u_dll);
+    end
+
+    // ================================================================
+    // MAIN TEST
+    // ================================================================
+    initial begin
+        real throughput;
+        real efficiency;
+        real avg_latency;
+
+        $display("");
+        $display("+=========================================================+");
+        $display("|        PCIe Gen3 TL+DLL INTEGRATION TESTBENCH           |");
+        $display("|        Signal-complete waveform + verification build     |");
+        $display("+=========================================================+");
+        $display("| Sim Start     : %0t", $time);
+        $display("| Waveform file : wave.vcd");
+        $display("+=========================================================+");
+        $display("");
+        $display("  Waveform groups:");
+        $display("  [G1] TL  : payload_valid, tlp_valid, tlp_type, tlp_length,");
+        $display("             tlp_requester_id, tlp_tag, tlp_payload_word");
+        $display("  [G2] DLL TX: phy_tx_valid, tx_seq_num, tx_lcrc, tx_dllp_ctrl");
+        $display("  [G3] DLL RX: phy_rx_valid, crc_ok, ack_req, nak_req");
+        $display("  [G4] CTRL:   rst_n/link_up, tl_active, dll_tx_active,");
+        $display("               dll_rx_active");
+        $display("  [G5] METRICS:v_tx_count, v_rx_count, v_ack_count,");
+        $display("               v_nak_count, v_cycle_count");
+        $display("");
+
+        env = new(dut_if);
+        env.run();
+
+        #200;
+
+        // ── Performance ───────────────────────────────────────
+        throughput  = (tx_count > 1) ?
+                      tx_count * 1.0 / ((last_tx_time - first_tx_time + 1.0) / 10.0) :
+                      tx_count * 1.0;
+        efficiency  = (cycle_count > 0) ? tx_count * 1.0 / cycle_count : 0.0;
+        avg_latency = (tx_count    > 0) ?
+                      ((last_tx_time - payload_time) / 10.0) / tx_count : 0.0;
+
+        $display("");
+        $display("+=========================================================+");
+        $display("|                 PERFORMANCE SUMMARY                     |");
+        $display("+=========================================================+");
+        $display("|  Total Cycles      : %-6d                             |", cycle_count);
+        $display("|  PHY TX Packets    : %-6d                             |", tx_count);
+        $display("|  PHY RX Packets    : %-6d                             |", rx_count);
+        $display("|  ACK Count         : %-6d                             |", ack_count);
+        $display("|  NAK Count         : %-6d                             |", nak_count);
+        $display("+---------------------------------------------------------+");
+        $display("|  Throughput        : %-10.4f pkt/ns                 |", throughput);
+        $display("|  Bus Efficiency    : %-10.6f tx/cycle              |", efficiency);
+        $display("|  Avg TX Latency    : %-10.2f ns                    |", avg_latency);
+        $display("+=========================================================+");
+        $display("");
+
+        $finish;
+    end
+
+    // ── Timeout watchdog ──────────────────────────────────────────
+    initial begin
+        #50000;
+        $display("[TIMEOUT] 50000 ns exceeded - forcing $finish");
+        $finish;
+    end
+
+endmodule
