@@ -1,0 +1,41 @@
+`timescale 1ns/1ps
+
+module dl_rx_engine(
+
+    input  logic clk,
+    input  logic rst_n,
+
+    input  logic [203:0] phy_rx_data,
+    input  logic         phy_rx_valid,
+
+    output logic crc_ok,
+    output logic ack_req,
+    output logic nak_req
+);
+
+logic crc_valid;
+
+dl_lcrc_check crc_check(
+    .clk(clk),
+    .rst_n(rst_n),
+    .packet(phy_rx_data),
+    .packet_valid(phy_rx_valid),
+    .crc_ok(crc_ok)
+);
+
+// generate delayed valid aligned with crc_ok
+always_ff @(posedge clk or negedge rst_n) begin
+    if(!rst_n)
+        crc_valid <= 0;
+    else
+        crc_valid <= phy_rx_valid;
+end
+
+dl_ack_nak_gen ack_nak(
+    .rx_valid(crc_valid),   // ? FIXED PIPELINE ALIGNMENT
+    .crc_ok(crc_ok),
+    .ack_req(ack_req),
+    .nak_req(nak_req)
+);
+
+endmodule
