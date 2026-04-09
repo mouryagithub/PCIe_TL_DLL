@@ -1,0 +1,211 @@
+`timescale 1ns/1ps
+
+module request_generator(
+
+input  wire clk,
+input  wire rst_n,
+
+output reg req_valid,
+
+//DW0
+output reg [2:0] req_fmt,
+output reg [4:0] req_type,
+output reg t9,
+output reg [2:0] traffic_class,
+output reg t8,
+output reg [2:0] attr,
+output reg R,
+output reg th,
+output reg td,
+output reg ep,
+output reg [1:0] at,
+output reg [9:0] data_length,
+
+//DW1
+output reg [15:0] request_id,
+output reg [7:0] Tag,
+output reg [3:0] last_DW,
+output reg [3:0] first_DW,
+
+//DW2
+output reg [7:0] Busnum,
+output reg [63:0] Address,
+output reg ph
+
+);
+
+reg [7:0] counter;
+reg [3:0] tlp_sel;
+
+/////////////////////////////////////
+// TLP TYPE ENUMERATION
+/////////////////////////////////////
+
+localparam MRD     = 4'd0;
+localparam MRDLK   = 4'd1;
+localparam MWR     = 4'd2;
+localparam IORD    = 4'd3;
+localparam IOWR    = 4'd4;
+localparam CFGRD0  = 4'd5;
+localparam CFGWR0  = 4'd6;
+localparam CFGRD1  = 4'd7;
+localparam CFGWR1  = 4'd8;
+localparam MSG     = 4'd9;
+localparam MSGD    = 4'd10;
+localparam CPL     = 4'd11;
+localparam CPLD    = 4'd12;
+
+/////////////////////////////////////
+// SEQUENTIAL BLOCK
+/////////////////////////////////////
+
+always @(posedge clk or negedge rst_n) begin
+
+if(!rst_n) begin
+
+req_valid <= 0;
+counter <= 0;
+
+/* MWR as default after reset */
+tlp_sel <= MWR;
+
+t9 <= 0;
+traffic_class <= 0;
+t8 <= 0;
+attr <= 0;
+R <= 0;
+th <= 0;
+td <= 0;
+ep <= 0;
+at <= 0;
+
+data_length <= 10'h001;
+
+request_id <= 16'h0100;
+
+Tag <= 8'h01;
+
+first_DW <= 4'hF;
+last_DW  <= 4'hF;
+
+Busnum <= 0;
+
+Address <= 64'h0000_1234_5678_0000;
+
+ph <= 0;
+
+end
+
+else begin
+
+if(counter == 8'd10) begin
+
+req_valid <= 1;
+counter <= 0;
+
+Tag <= Tag + 1;
+Address <= Address + 64'h10;
+
+if(tlp_sel == CPLD)
+    tlp_sel <= MWR;
+else
+    tlp_sel <= tlp_sel + 1;
+
+end
+
+else begin
+
+counter <= counter + 1;
+req_valid <= 0;
+
+end
+
+end
+end
+
+/////////////////////////////////////
+// TLP FORMAT + TYPE GENERATION
+/////////////////////////////////////
+
+always @(*) begin
+
+req_fmt  = 3'b000;
+req_type = 5'b00000;
+
+case(tlp_sel)
+
+MRD: begin
+req_fmt  = 3'b000;
+req_type = 5'b00000;
+end
+
+MRDLK: begin
+req_fmt  = 3'b000;
+req_type = 5'b00001;
+end
+
+MWR: begin
+req_fmt  = 3'b010;
+req_type = 5'b00000;
+end
+
+IORD: begin
+req_fmt  = 3'b000;
+req_type = 5'b00010;
+end
+
+IOWR: begin
+req_fmt  = 3'b010;
+req_type = 5'b00010;
+end
+
+CFGRD0: begin
+req_fmt  = 3'b000;
+req_type = 5'b00100;
+end
+
+CFGWR0: begin
+req_fmt  = 3'b010;
+req_type = 5'b00100;
+end
+
+CFGRD1: begin
+req_fmt  = 3'b000;
+req_type = 5'b00101;
+end
+
+CFGWR1: begin
+req_fmt  = 3'b010;
+req_type = 5'b00101;
+end
+
+MSG: begin
+req_fmt  = 3'b001;
+req_type = 5'b10000;
+end
+
+MSGD: begin
+req_fmt  = 3'b011;
+req_type = 5'b10000;
+end
+
+CPL: begin
+req_fmt  = 3'b000;
+req_type = 5'b01010;
+end
+
+CPLD: begin
+req_fmt  = 3'b010;
+req_type = 5'b01010;
+end
+
+default: begin
+req_fmt  = 3'b000;
+req_type = 5'b00000;
+end
+
+endcase
+
+end
+
+endmodule
